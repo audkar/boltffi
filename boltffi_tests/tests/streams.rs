@@ -239,6 +239,109 @@ mod struct_values_work {
     }
 }
 
+mod wire_encoded_struct_values_work {
+    use super::*;
+
+    #[test]
+    fn wire_encoded_struct_preserved_through_stream() {
+        let stream = MessageRecordStream::new();
+        let sub = stream.subscribe();
+
+        let record = FixtureMessageRecord {
+            label: "hello".to_string(),
+            anchor: FixturePoint { x: 1.0, y: 2.0 },
+            status: FixtureStatus::Active,
+        };
+        stream.emit(record.clone());
+
+        let received = sub.pop_event().unwrap();
+        assert_eq!(received.label, "hello");
+        assert_eq!(received.anchor.x, 1.0);
+        assert_eq!(received.status, FixtureStatus::Active);
+    }
+
+    /// Regression test for the ABI mismatch between `boltffi_macros` and
+    /// `boltffi_bindgen` for wire-encoded stream items.
+    ///
+    /// Wire-encoded types (structs containing `String`, `Vec`, etc.) must use
+    /// a 2-argument `pop_batch(sub, max_count) -> FfiBuf` on the Rust side,
+    /// because `boltffi_bindgen` generates JNI/C glue that calls exactly that
+    /// signature.  If the macro emits the 3-argument direct version instead,
+    /// the JNI call passes `max_count` (e.g. 16) as `output_ptr`, which causes
+    /// an immediate "misaligned pointer dereference" panic.
+    #[test]
+    fn wire_encoded_pop_batch_ffi_returns_ffi_buf() {
+        let stream = MessageRecordStream::new();
+        let sub = stream.subscribe();
+
+        let record = FixtureMessageRecord {
+            label: "test".to_string(),
+            anchor: FixturePoint::default(),
+            status: FixtureStatus::Pending,
+        };
+        stream.emit(record);
+
+        let raw = std::sync::Arc::into_raw(sub);
+        let buf = unsafe {
+            boltffi_message_record_stream_subscribe_pop_batch(
+                raw as boltffi::__private::SubscriptionHandle,
+                16,
+            )
+        };
+
+        // A wire-encoded batch should have produced a non-empty FfiBuf.
+        assert!(!buf.as_ptr().is_null(), "expected non-null FfiBuf ptr");
+        assert!(buf.len() > 0, "expected non-zero FfiBuf len");
+
+        // Decode the buffer to verify contents.
+        let bytes: Vec<u8> =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()).to_vec() };
+        drop(buf); // free the FfiBuf allocation
+
+        // Wire format for Vec<T> is: [count: i32 LE][item0][item1]...
+        let count = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        assert_eq!(count, 1, "expected 1 item in batch");
+
+        unsafe {
+            // Reconstruct the Arc so the subscription is properly dropped.
+            let _ = std::sync::Arc::from_raw(raw);
+        }
+    }
+
+    /// Regression test for the empty-batch path in the wire-encoded `pop_batch`.
+    ///
+    /// When no events are available the macro must return `FfiBuf::empty()`
+    /// (len == 0).  If it instead returns `FfiBuf::wire_encode(&vec![])` the
+    /// buffer contains the 4-byte count prefix `[0,0,0,0]`, which the JNI side
+    /// forwards to Kotlin as a non-empty `ByteArray`.  The Kotlin polling loop
+    /// then spins forever because `bytes.isEmpty()` is never true.
+    #[test]
+    fn wire_encoded_pop_batch_empty_returns_zero_len_buf() {
+        let stream = MessageRecordStream::new();
+        let sub = stream.subscribe();
+
+        // Do NOT emit anything — subscription is empty.
+        let raw = std::sync::Arc::into_raw(sub);
+        let buf = unsafe {
+            boltffi_message_record_stream_subscribe_pop_batch(
+                raw as boltffi::__private::SubscriptionHandle,
+                16,
+            )
+        };
+
+        assert!(
+            buf.as_ptr().is_null(),
+            "expected null ptr for empty batch, got {:?}",
+            buf.as_ptr()
+        );
+        assert_eq!(buf.len(), 0, "expected zero len for empty batch");
+
+        unsafe {
+            let _ = std::sync::Arc::from_raw(raw);
+        }
+    }
+}
+
 mod concurrent_access_is_safe {
     use super::*;
 

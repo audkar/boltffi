@@ -17,8 +17,10 @@ use crate::exports::extern_export::{
 };
 use crate::index::CrateIndex;
 use crate::index::callback_traits::CallbackTraitRegistry;
+use crate::index::data_types::{DataTypeCategory, DataTypeRegistry};
 use crate::lowering::params::{FfiParams, transform_method_params, transform_method_params_async};
 use crate::lowering::returns::lower::encoded_return_body;
+use crate::lowering::transport::TypeShapeExt;
 use crate::lowering::returns::model::{
     ResolvedReturn, ReturnInvocationContext, ReturnLoweringContext, ReturnPlatform,
     WasmOptionScalarEncoding,
@@ -491,6 +493,7 @@ pub fn ffi_class_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &type_name_str,
                     callable,
                     &item_type,
+                    &data_types,
                 ));
             }
             match (callable.form(), callable.execution_kind()) {
@@ -1325,6 +1328,7 @@ fn generate_stream_exports(
     class_name: &str,
     callable: MethodCallable<'_>,
     item_type: &syn::Type,
+    data_types: &DataTypeRegistry,
 ) -> proc_macro2::TokenStream {
     let method = callable.method();
     let method_name = &method.sig.ident;
@@ -1355,6 +1359,62 @@ fn generate_stream_exports(
         method_name.span(),
     );
 
+    let is_direct = item_type.is_primitive_type()
+        || data_types
+            .category_for(item_type)
+            .is_some_and(|cat| matches!(cat, DataTypeCategory::Scalar | DataTypeCategory::Blittable));
+
+    let pop_batch_fn = if is_direct {
+        quote! {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn #pop_batch_ident(
+                subscription_handle: ::boltffi::__private::SubscriptionHandle,
+                output_ptr: *mut #item_type,
+                output_capacity: usize,
+            ) -> usize {
+                if subscription_handle.is_null() || output_ptr.is_null() || output_capacity == 0 {
+                    return 0;
+                }
+                let subscription = unsafe {
+                    &*(subscription_handle as *const ::boltffi::__private::EventSubscription<#item_type>)
+                };
+                let output_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        output_ptr as *mut std::mem::MaybeUninit<#item_type>,
+                        output_capacity,
+                    )
+                };
+                subscription.pop_batch_into(output_slice)
+            }
+        }
+    } else {
+        quote! {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn #pop_batch_ident(
+                subscription_handle: ::boltffi::__private::SubscriptionHandle,
+                max_count: usize,
+            ) -> ::boltffi::__private::FfiBuf {
+                if subscription_handle.is_null() || max_count == 0 {
+                    return ::boltffi::__private::FfiBuf::empty();
+                }
+                let subscription = unsafe {
+                    &*(subscription_handle as *const ::boltffi::__private::EventSubscription<#item_type>)
+                };
+                let mut batch = Vec::with_capacity(max_count);
+                for _ in 0..max_count {
+                    match subscription.pop_event() {
+                        Some(event) => batch.push(event),
+                        None => break,
+                    }
+                }
+                if batch.is_empty() {
+                    return ::boltffi::__private::FfiBuf::empty();
+                }
+                ::boltffi::__private::FfiBuf::wire_encode(&batch)
+            }
+        }
+    };
+
     quote! {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn #subscribe_ident(
@@ -1368,26 +1428,7 @@ fn generate_stream_exports(
             std::sync::Arc::into_raw(subscription) as ::boltffi::__private::SubscriptionHandle
         }
 
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn #pop_batch_ident(
-            subscription_handle: ::boltffi::__private::SubscriptionHandle,
-            output_ptr: *mut #item_type,
-            output_capacity: usize,
-        ) -> usize {
-            if subscription_handle.is_null() || output_ptr.is_null() || output_capacity == 0 {
-                return 0;
-            }
-            let subscription = unsafe {
-                &*(subscription_handle as *const ::boltffi::__private::EventSubscription<#item_type>)
-            };
-            let output_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    output_ptr as *mut std::mem::MaybeUninit<#item_type>,
-                    output_capacity,
-                )
-            };
-            subscription.pop_batch_into(output_slice)
-        }
+        #pop_batch_fn
 
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn #wait_ident(

@@ -573,6 +573,34 @@ impl PointStream {
     }
 }
 
+pub struct MessageRecordStream {
+    subscription: Arc<EventSubscription<FixtureMessageRecord>>,
+}
+
+impl Default for MessageRecordStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[export]
+impl MessageRecordStream {
+    pub fn new() -> Self {
+        Self {
+            subscription: Arc::new(EventSubscription::new(32)),
+        }
+    }
+
+    pub fn emit(&self, record: FixtureMessageRecord) {
+        self.subscription.push_event(record);
+    }
+
+    #[ffi_stream(item = FixtureMessageRecord)]
+    pub fn subscribe(&self) -> Arc<EventSubscription<FixtureMessageRecord>> {
+        Arc::clone(&self.subscription)
+    }
+}
+
 pub struct TestCounter {
     value: i32,
 }
